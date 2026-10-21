@@ -30,6 +30,7 @@ const TEN = require('./lib/tenancy');
 const ROLLUP = require('./lib/rollup');
 const GOALS = require('./lib/goals');
 const { Push } = require('./lib/push');
+const { SharedMap } = require('./lib/shared-map');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PIN = process.env.ADMIN_PIN || '1234';
@@ -147,6 +148,8 @@ const { Store } = require('./lib/store');
 const STORE = new Store(KEYS, { dataDir: DATA_DIR });
 
 async function load() {
+  // logins / OTP codes live in db so every running copy (Vercel) shares them
+  for (const k of SharedMap.keys()) { if (!KEYS.includes(k)) KEYS.push(k); if (!db[k]) db[k] = {}; }
   await STORE.init(db);
   if (!STORE.status().durable)
     console.warn('[nexus] storage is a local file — set MONGODB_URI or DATABASE_URL for durable storage');
@@ -154,6 +157,7 @@ async function load() {
 /* save()      — everything that changes during trading (excludes the catalogue)
    saveAll()   — include the catalogue; only when products really changed       */
 function save(...keys) { STORE.save(...keys); }
+SharedMap.bind(() => db, k => STORE.save(k));
 function saveAll() { STORE.saveAll(); }
 
 /* ── seed catalog on first boot ──
@@ -3085,8 +3089,8 @@ app.post('/api/coupon/check', GUARD.limit('write'), (req, res) => {
    by a one-time code, so orders and personal offers follow the
    shopper across devices instead of living in localStorage.
 ══════════════════════════════════════════════════════════ */
-const PASSWORD_SESSIONS = new Map();
-const CUSTOMER_PIN_RESETS = new Map();
+const PASSWORD_SESSIONS = new SharedMap('devx-sess-password');
+const CUSTOMER_PIN_RESETS = new SharedMap('devx-pin-resets');
 function customerNameKey(name){return String(name||'').trim().replace(/\s+/g,' ').toLowerCase();}
 function issueCustomerPinReset(phone){const code=String(crypto.randomInt(100000,1000000));const expiresAt=Date.now()+5*60*1000;CUSTOMER_PIN_RESETS.set(phone,{code,expiresAt,attempts:0});return {code,expiresAt};}
 const PHONE_DIGITS_BY_CC={971:9,966:9,974:8,968:8,965:8,973:8};
@@ -3139,7 +3143,7 @@ function ownsOrder(req, o, staffPerm) {
 
 
 /* ── Forgot PIN email OTP — additive only; existing SMS flow unchanged ── */
-const CUSTOMER_EMAIL_RESETS = new Map();
+const CUSTOMER_EMAIL_RESETS = new SharedMap('devx-email-resets');
 
 function normaliseCustomerEmail(raw) {
   const email = String(raw || '').trim().toLowerCase();

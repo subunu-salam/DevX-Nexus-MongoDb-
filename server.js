@@ -1484,7 +1484,11 @@ app.post('/api/concierge', GUARD.limit('concierge'), GUARD.sanePrompt, async (re
   // Reuse the sticky budget for cart-shaped follow-ups (not for one-off lookups
   // like "where is milk" or a nutrition question).
   const cartish = /\b(cart|basket|list|add|more|another|also|cheaper|instead|budget|buy|shop|grocery|groceries|week|month|people|family|protein|meal)\b/i.test(prompt);
-  const budget = askedBudget || ((stickyBudget && cartish) ? stickyBudget : null);
+  /* "Add biscuits" on top of a budget cart adds biscuits — it must NOT rebuild or
+     pad the cart up to the budget (that put 6 biscuits + 6 bags of rice in).
+     The budget still applies when they refine it ("cheaper", "within budget"). */
+  const plainAddOn = addOn && !wantsRefine && !askedBudget;
+  const budget = askedBudget || ((stickyBudget && cartish && !plainAddOn) ? stickyBudget : null);
 
   /* For nutrition questions, inject the real per-100g facts for the products the
      shopper is asking about (or their current cart context) so the AI quotes
@@ -1812,7 +1816,7 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
               : (intent === 'navigation' || /\bwhere\b|\bwhich (?:aisle|shelf|rack)\b|\bfind\b|\blocate\b/i.test(prompt)) && plan[0] && plan[0].p.loc
               ? `${plan[0].p.name} is at ${plan[0].p.loc}.` + (plan.length > 1 ? ` I've also listed ${plan.slice(1, 3).map(r => r.p.name).join(' and ')}.` : '') + ' Tap Navigate to get walking directions.'
               : plan.length === 1
-              ? `Here's ${plan[0].p.name}. Tap it to see other brands and sizes.`
+              ? (addOn ? `Sure — ${plan[0].p.name} ready to add to your cart.` : `Here you go — ${plan[0].p.name}.`) + ' Tap it to see other brands and sizes.'
               : `I found ${plan.length} items for you — including ${productNames}. Tap any item to see more brands and sizes.`)
           : `I couldn't find an exact match. Try describing what you need differently, e.g. "bread, cheese and tomatoes for a sandwich".`),
         Malayalam: `നിങ്ങളുടെ അഭ്യർത്ഥനയ്ക്ക് അനുയോജ്യമായ ഉൽപ്പന്നങ്ങൾ ലഭ്യമാണ്. ബ്രാൻഡ്, സൈസ് കാണാൻ ഓരോ ഉൽപ്പന്നവും ടാപ്പ് ചെയ്യൂ.`,

@@ -407,6 +407,12 @@ app.use((err, req, res, next) => {
 app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 /* ── API ── */
+app.get('/api/health/db', async (req, res) => {
+  let ms = null, error = null;
+  try { ms = await STORE.ping(); } catch (e) { error = e.message; }
+  res.json({ driver: STORE.status().driver, ping_ms: ms, error,
+             region: process.env.VERCEL_REGION || null, uptime_s: Math.round(process.uptime()) });
+});
 app.get('/api/health', (req, res) => {
   const m = process.memoryUsage();
   res.json({
@@ -3785,12 +3791,25 @@ const ready = (async () => {
    app, and — for anything that changes data — save to MongoDB BEFORE the reply
    is sent, because Vercel may freeze the instance right after it. */
 const CATALOG_KEYS = ['devx-catalog', 'devx-catalogs'];
+const BOOTED_AT = Date.now();
+let lastRefresh = 0;
+const REFRESH_MS = 2000;   // reads may be up to 2 s behind other instances; writes are always fresh
 async function vercelHandler(req, res) {
+  const t0 = Date.now();
+  const cold = !lastRefresh;
   await ready;
-  try {
-    const changed = await STORE.refresh();
-    if (changed.some(k => CATALOG_KEYS.includes(k))) reindex();
-  } catch (e) { console.error('[nexus] refresh failed:', e.message); }
+  const t1 = Date.now();
+  const isWrite = !['GET', 'HEAD', 'OPTIONS'].includes(req.method);
+  if (isWrite || t1 - lastRefresh > REFRESH_MS) {
+    try {
+      const changed = await STORE.refresh();
+      lastRefresh = Date.now();
+      if (changed.some(k => CATALOG_KEYS.includes(k))) reindex();
+    } catch (e) { console.error('[nexus] refresh failed:', e.message); }
+  }
+  const t2 = Date.now();
+  // visible in browser DevTools → Network → Timing: where each request spent its time
+  try { res.setHeader('Server-Timing', `boot;dur=${t1 - t0}${cold ? ';desc="cold start"' : ''}, sync;dur=${t2 - t1}`); } catch (_) {}
   {
     // flush is a no-op when nothing changed, so it is safe on every request
     const end = res.end;

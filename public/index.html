@@ -7385,6 +7385,43 @@ async function navCurrentStoreLabel(){
   p.innerHTML='<svg viewBox="0 0 24 24"><path d="M21 10c0 7-9 13-9 13S3 17 3 10a9 9 0 0118 0z"/><circle cx="12" cy="10" r="3"/></svg><span>'+esc(label)+'</span><svg viewBox="0 0 24 24" class="store-nav-chevron"><polyline points="6 9 12 15 18 9"/></svg>';
   document.querySelectorAll('.store-nav-current-store-label').forEach(el=>{el.textContent=label});
 }
+/* Shortest walk: from the entrance, always go to the closest remaining stop
+   (by position on the store map), then improve the order with 2-opt so the
+   path never crosses back on itself, and finish at checkout. Distances are
+   walking-style (along aisles/corridors, not diagonals through shelves).
+   Returns null when the map has no positions for the stops. */
+function navShortestOrder(stops){
+  if(!stops.length)return [];
+  const pt=s=>{try{return navStopPoint(s)}catch(e){return null}};
+  const pts=stops.map(pt);
+  if(pts.some(p=>!p||!isFinite(p.x)||!isFinite(p.y)))return null;
+  const entryEl=navLayoutEl('entry')||navLayoutEl('entrance');
+  const start=navElementCenter(entryEl)||{x:5,y:5};
+  const end=navCheckoutPoint();
+  const d=(a,b)=>Math.abs(a.x-b.x)+Math.abs(a.y-b.y);
+  const n=stops.length, idx=[...Array(n).keys()];
+  const walk=o=>{let c=start,t=0;for(const i of o){t+=d(c,pts[i]);c=pts[i]}return t+(end?d(c,end):0)};
+  // up to 8 stops: try every order and keep the truly shortest walk
+  if(n<=8){
+    let best=idx.slice(),bl=walk(best);
+    const perm=(arr,k)=>{if(k===arr.length){const l=walk(arr);if(l<bl){bl=l;best=arr.slice()}return}
+      for(let i=k;i<arr.length;i++){[arr[k],arr[i]]=[arr[i],arr[k]];perm(arr,k+1);[arr[k],arr[i]]=[arr[i],arr[k]]}};
+    perm(idx.slice(),0);
+    return best.map(i=>stops[i]);
+  }
+  // more stops: nearest neighbour from the entrance, then 2-opt until no segment reversal helps
+  let order=[];let cur=start;const left=new Set(idx);
+  while(left.size){let b=null,bd=Infinity;for(const i of left){const v=d(cur,pts[i]);if(v<bd){bd=v;b=i}}order.push(b);left.delete(b);cur=pts[b];}
+  let bl=walk(order),improved=true,guard=0;
+  while(improved&&guard++<80){
+    improved=false;
+    for(let i=0;i<n-1;i++)for(let k=i+1;k<n;k++){
+      const cand=order.slice(0,i).concat(order.slice(i,k+1).reverse(),order.slice(k+1));
+      const l=walk(cand);if(l+1e-9<bl){order=cand;bl=l;improved=true;}
+    }
+  }
+  return order.map(i=>stops[i]);
+}
 function buildStoreNavRoute(items){
   const raw=(items||[]).map((item,index)=>Object.assign({__index:index},item));
   const groups=new Map();
@@ -7396,15 +7433,17 @@ function buildStoreNavRoute(items){
   });
   let stops=[...groups.values()].filter(s=>s.loc);
   const unknown=[...groups.values()].filter(s=>!s.loc);
-  /* Serpentine aisle sweep: enter each aisle once, move rack-to-rack in the
-     direction that keeps the next aisle close, then continue forward. */
-  const aisles=[...new Set(stops.map(s=>s.loc.aisle))].sort((a,b)=>{const aa=navAisleAnchor(a),bb=navAisleAnchor(b);return (Number(aa&&aa.order)||a)-(Number(bb&&bb.order)||b);});
-  const ordered=[];
-  aisles.forEach((aisle,idx)=>{
-    const row=stops.filter(s=>s.loc.aisle===aisle).sort((a,b)=>a.loc.rack-b.loc.rack || a.loc.shelf-b.loc.shelf);
-    if(idx%2)row.reverse();
-    row.forEach(x=>ordered.push(x));
-  });
+  let ordered=navShortestOrder(stops);
+  if(!ordered){
+    /* No drawn map: fall back to a serpentine aisle sweep by aisle number. */
+    const aisles=[...new Set(stops.map(s=>s.loc.aisle))].sort((a,b)=>{const aa=navAisleAnchor(a),bb=navAisleAnchor(b);return (Number(aa&&aa.order)||a)-(Number(bb&&bb.order)||b);});
+    ordered=[];
+    aisles.forEach((aisle,idx)=>{
+      const row=stops.filter(s=>s.loc.aisle===aisle).sort((a,b)=>a.loc.rack-b.loc.rack || a.loc.shelf-b.loc.shelf);
+      if(idx%2)row.reverse();
+      row.forEach(x=>ordered.push(x));
+    });
+  }
   unknown.forEach(x=>ordered.push(x));
   // Every in-store journey ends at the store's configured checkout counter.
   ordered.push({key:'checkout',isCheckout:true,loc:null,items:[]});

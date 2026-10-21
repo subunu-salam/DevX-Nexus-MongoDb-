@@ -1481,14 +1481,14 @@ app.post('/api/concierge', GUARD.limit('concierge'), GUARD.sanePrompt, async (re
   if (askedBudget) SESSION_BUDGET.set(sessionId, askedBudget);
   else if (/\b(no budget|forget the budget|without budget|reset)\b/i.test(prompt)) SESSION_BUDGET.delete(sessionId);
   const stickyBudget = SESSION_BUDGET.get(sessionId) || null;
-  // Reuse the sticky budget for cart-shaped follow-ups (not for one-off lookups
-  // like "where is milk" or a nutrition question).
-  const cartish = /\b(cart|basket|list|add|more|another|also|cheaper|instead|budget|buy|shop|grocery|groceries|week|month|people|family|protein|meal)\b/i.test(prompt);
   /* "Add biscuits" on top of a budget cart adds biscuits — it must NOT rebuild or
      pad the cart up to the budget (that put 6 biscuits + 6 bags of rice in).
      The budget still applies when they refine it ("cheaper", "within budget"). */
-  const plainAddOn = addOn && !wantsRefine && !askedBudget;
-  const budget = askedBudget || ((stickyBudget && cartish && !plainAddOn) ? stickyBudget : null);
+  /* The budget applies ONLY to the message that asks for it. The next search
+     starts fresh — unless the shopper explicitly points back to it
+     ("within my budget", "same budget", "keep it under budget"). */
+  const refersToBudget = /\b(?:within|under|in|inside|keep(?: it)? (?:under|within)|same|my|that|the)\s+budget\b/i.test(prompt);
+  const budget = askedBudget || ((stickyBudget && refersToBudget) ? stickyBudget : null);
 
   /* For nutrition questions, inject the real per-100g facts for the products the
      shopper is asking about (or their current cart context) so the AI quotes

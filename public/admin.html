@@ -1219,9 +1219,13 @@ async function nxBoot(){
        has no orders and would wipe the dashboard. */
     const r=await fetch('/api/state',{headers:authHeaders(),cache:'no-store'});
     if(!r.ok)return;
-    const st=await r.json();
+    const raw=await r.text();
+    if(raw===window.__lastPoll)return;          // nothing changed — don't redraw
+    const st=JSON.parse(raw);
     if(!st||!st['branch-meta'])return;
-    Object.assign(CACHE,st);onRemote()}catch(e2){}},4000)}
+    window.__lastPoll=raw;
+    Object.assign(CACHE,st);
+    window.__fromPoll=true;try{onRemote()}finally{window.__fromPoll=false}}catch(e2){}},4000)}
 }
 function onRemote(){
   reload();
@@ -1380,7 +1384,7 @@ function renderView(){
   else if(curView==='fin')loadFinancial();
   else if(curView==='wh')loadWarehouse();
   else if(curView==='branch')loadBranches();
-  else if(curView==='mapbuilder')loadMapBuilder();
+  else if(curView==='mapbuilder'){if(!window.__fromPoll)loadMapBuilder();}
   else if(curView==='group')loadGroup();
   else if(curView==='roles')loadRoles();
   else if(curView==='branding')loadBranding();

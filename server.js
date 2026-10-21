@@ -78,6 +78,8 @@ const TRANSCRIBER = groq
   : null;
 
 console.log('[nexus] LLM provider:', LLM ? LLM.name : 'NONE (keyword fallback only — add GROQ_API_KEY)');
+// Visible on /api/health/db — tells at a glance whether the AI is answering or the keyword fallback is.
+const LLM_STATUS = { configured: !!LLM, provider: LLM ? LLM.name : null, lastOkAt: null, lastErrorAt: null, lastError: null, lastMs: null };
 
 // Vision layer for the unified product scanner. Keep this separate from the
 // concierge model so an image-capable model is always selected when a provider
@@ -410,7 +412,7 @@ app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.get('/api/health/db', async (req, res) => {
   let ms = null, error = null;
   try { ms = await STORE.ping(); } catch (e) { error = e.message; }
-  res.json({ driver: STORE.status().driver, ping_ms: ms, error,
+  res.json({ driver: STORE.status().driver, ping_ms: ms, error, ai: LLM_STATUS,
              region: process.env.VERCEL_REGION || null, uptime_s: Math.round(process.uptime()) });
 });
 app.get('/api/health', (req, res) => {
@@ -564,10 +566,13 @@ app.get('/api/categories', (req, res) => {
 ══════════════════════════════════════════════════════════ */
 
 /* ── 1. Conversation Memory (per session) ── */
-const SESSIONS = new Map();          // session_id -> [{ role, content }, ...]
+/* Conversation state lives in the shared db state (SharedMap), so on Vercel
+   a follow-up ("Margherita" after "which pizza?") reaches the same context
+   whichever running copy serves it. */
+const SESSIONS = new SharedMap('devx-chat-memory');   // session_id -> [{ role, content }, ...]
 const MEM_TURNS = 8;                 // remember last 8 messages (4 exchanges)
 const SESSION_TTL = 1000 * 60 * 60;  // forget a session after 1h idle
-const SESSION_SEEN = new Map();      // session_id -> last activity ts
+const SESSION_SEEN = new SharedMap('devx-chat-seen');  // session_id -> last activity ts
 
 function getMemory(sid) {
   if (!SESSIONS.has(sid)) SESSIONS.set(sid, []);
@@ -576,25 +581,23 @@ function getMemory(sid) {
 }
 function pushMemory(sid, role, content) {
   const h = getMemory(sid);
-  h.push({ role, content });
+  h.push({ role, content: String(content || '').slice(0, 1200) });
   while (h.length > MEM_TURNS) h.shift();
+  SESSIONS.set(sid, h);   // persist the change
 }
 // Track which product groups we've already shown in a session, so follow-up
 // "add drinks / also / more" requests only surface NEW items, never repeats.
-const SUGGESTED = new Map();               // session_id -> Set(groupKey)
-function suggestedSet(sid) {
-  if (!SUGGESTED.has(sid)) SUGGESTED.set(sid, new Set());
-  return SUGGESTED.get(sid);
-}
+const SUGGESTED = new SharedMap('devx-chat-suggested');   // session_id -> [groupKey]
+function suggestedSet(sid) { return new Set(SUGGESTED.get(sid) || []); }
 const ADDON_RE = /\b(add|also|more|another|extra|plus|include|as well|too|instead|swap|to go with|alongside|with (that|it)|something (else|sweet)|dessert|drinks?)\b/i;
 // Remember if we just asked the shopper a clarifying question, so their next
 // message is treated as the ANSWER (and we don't loop asking again).
-const PENDING_CLARIFY = new Map();   // session_id -> last clarify question
+const PENDING_CLARIFY = new SharedMap('devx-chat-clarify');   // session_id -> last clarify question
 // periodic cleanup of idle sessions
 setInterval(() => {
   const now = Date.now();
   for (const [sid, ts] of SESSION_SEEN) {
-    if (now - ts > SESSION_TTL) { SESSIONS.delete(sid); SESSION_SEEN.delete(sid); }
+    if (now - ts > SESSION_TTL) { SESSIONS.delete(sid); SESSION_SEEN.delete(sid); SUGGESTED.delete(sid); PENDING_CLARIFY.delete(sid); SESSION_LANG.delete(sid); SESSION_BUDGET.delete(sid); }
   }
 }, 1000 * 60 * 10).unref();
 
@@ -627,16 +630,20 @@ function classifyIntent(q) {
 const AMBIGUOUS_DISHES = {
   biryani: ['Chicken Biryani', 'Mutton Biryani', 'Prawn Biryani', 'Vegetable Biryani'],
   curry:   ['Chicken Curry', 'Fish Curry', 'Vegetable Curry', 'Paneer Curry'],
-  pasta:   ['Chicken Pasta', 'Creamy Alfredo', 'Veg Pasta'],
-  pizza:   ['Chicken Pizza', 'Margherita', 'Veg Pizza'],
+  pasta:   ['Chicken Pasta', 'Creamy Alfredo Pasta', 'Veg Pasta'],
+  pizza:   ['Chicken Pizza', 'Margherita Pizza', 'Veg Pizza'],
   mandi:   ['Chicken Mandi', 'Mutton Mandi'],
   kabsa:   ['Chicken Kabsa', 'Mutton Kabsa']
 };
 function ambiguousDish(prompt) {
   const t = ' ' + prompt.toLowerCase() + ' ';
-  if (/\b(chicken|mutton|lamb|prawn|shrimp|veg|vegetable|fish|beef|egg|paneer|mushroom|margherita)\b/.test(t)) return null;
+  if (/\b(chicken|mutton|lamb|prawn|shrimp|veg|vegetable|vegetarian|fish|beef|egg|paneer|mushroom|margherita|margarita|pepperoni|alfredo|carbonara|bolognese|arrabbiata|creamy)\b/.test(t)) return null;
   for (const [dish, opts] of Object.entries(AMBIGUOUS_DISHES)) {
-    if (new RegExp('\\b' + dish + '\\b').test(t)) return { dish, opts };
+    if (!new RegExp('\\b' + dish + '\\b').test(t)) continue;
+    // already names one of the choices (e.g. a tapped chip) -> nothing to ask
+    const qualifiers = opts.flatMap(o => o.toLowerCase().split(/\s+/)).filter(w => w !== dish && w.length > 2);
+    if (qualifiers.some(w => new RegExp('\\b' + w + '\\b').test(t))) return null;
+    return { dish, opts };
   }
   return null;
 }
@@ -698,7 +705,7 @@ const ISO_LANG = {
   kn:'Kannada', mr:'Marathi', pa:'Punjabi', si:'Sinhala', ne:'Nepali'
 };
 // Per-session sticky language (set by an explicit request or a non-Latin message).
-const SESSION_LANG = new Map();
+const SESSION_LANG = new SharedMap('devx-chat-lang');
 
 /* Budget: "100 AED", "AED 100", "under 50", "budget of 200", "₹100" */
 function parseBudget(text) {
@@ -717,7 +724,7 @@ function parseBudget(text) {
       || pick('(?:budget(?:\\s*(?:of|is))?|under|below|within|max(?:imum)?|up\\s*to|upto|around|about|for|of|worth)\\s*([0-9]{1,5}(?:\\.[0-9]+)?)');
 }
 // Sticky per-session budget so follow-ups ("i asked for 154", "add more") keep it.
-const SESSION_BUDGET = new Map();
+const SESSION_BUDGET = new SharedMap('devx-chat-budget');
 
 const INTENT_GUIDE = {
   product_search:        'Find and recommend the matching products from inventory.',
@@ -888,6 +895,46 @@ function parseLLMJson(text) {
 }
 
 
+/* ── Smart answers without the AI model ──────────────────────
+   When the LLM is unavailable these keep the assistant sensible: app
+   questions get real answers, off-topic chat is declined politely instead
+   of matching a random product, and "cheaper" refines what was just shown. */
+const OFF_TOPIC_RE = /\b(joke|jokes|funny|weather|forecast|news|football|cricket|match score|politic\w*|election|song|lyrics|poem|horoscope|who (?:won|is the president)|tell me about yourself|meaning of life)\b/i;
+const HOURS_RE = /\b(what time|opening hours?|closing time|open(?:ing)? (?:today|now|till|until)|close|closing|timings?|hours)\b/i;
+const CHEAPER_RE = /\b(cheaper|cheapest|less expensive|lower price|budget (?:one|option|brand)|more affordable|affordable one|value (?:one|option))\b/i;
+function smartFallback({ prompt, intent, history, already, groups, candidates }) {
+  const t = String(prompt || '');
+  if (intent === 'app_help' || /\b(weigh|weighing|weighed|weight change|actual weight)\b/i.test(t)) {
+    if (/\b(weigh|weighing|weighed|weight|kg|loose)\b/i.test(t))
+      return { reply: "Loose items like fruit, vegetables and rice are priced per kg. At checkout you pick an approximate weight and see an estimate; our team then weighs your items and the actual weight and price appear in My Orders. You're only charged for the actual weight — if it differs by more than 10%, we wait for you to approve the new total first.", suggestions: ['Fresh produce', 'Loose rice', 'My orders'] };
+    if (/\b(pay|payment|card|cash|online)\b/i.test(t))
+      return { reply: "You can pay cash to the driver, tap or insert your card on delivery, or pay online in the app. For weighed items, online payments are charged only after the final weight is confirmed.", suggestions: ['Start shopping', 'My orders'] };
+    if (/\b(track|status|where is my order|order history|previous order|my orders?)\b/i.test(t))
+      return { reply: "Open the Orders tab at the bottom to see every order with its live status, weighed prices and receipt.", suggestions: ['My orders', 'Start shopping'] };
+    if (/\b(cancel|change|modify|add (?:to|more to) (?:my )?order)\b/i.test(t))
+      return { reply: "You can add products to an order from its page in My Orders until it's dispatched — additions need a quick approval from the store. To cancel, contact the store from the order page.", suggestions: ['My orders'] };
+    if (/\b(deliver|delivery|slot|pickup|pick up|collect)\b/i.test(t))
+      return { reply: "Choose Delivery or Store Pickup at checkout and pick a time slot that suits you — available slots for your branch are shown there.", suggestions: ['Start shopping', 'My orders'] };
+  }
+  if (HOURS_RE.test(t) && /\b(you|store|shop|branch|supermarket|today|tonight|now)\b/i.test(t))
+    return { reply: "Store timings can vary by branch — you'll see your branch's details in the store selector at the top, and the available delivery and pickup slots at checkout.", suggestions: ['Start shopping', 'Change store'] };
+  if (OFF_TOPIC_RE.test(t) && !/\b(movie|party|night)\s+(snacks?|food|drinks?)\b/i.test(t))
+    return { reply: "I'm your shopping assistant, so I'll leave that one to someone else! I can find any product, plan a meal or build a shopping list for you.", suggestions: ['Ingredients for a dish', 'Snacks for movie night', 'Weekly groceries'] };
+  if (CHEAPER_RE.test(t) && already && already.size) {
+    const recent = [...already].slice(-3).reverse();
+    const plan = [], names = [];
+    for (const g of recent) {
+      const members = (groups.get(g) || []).filter(p => p.stock == null || p.stock > 0);
+      if (members.length < 1) continue;
+      const cheapest = members.slice().sort((a, b) => Number(a.price || 0) - Number(b.price || 0))[0];
+      const row = rowFromMembers([cheapest], 1, groups);
+      plan.push(row); names.push(cheapest.name + (cheapest.brand ? ' (' + cheapest.brand + ')' : ''));
+    }
+    if (plan.length) return { reply: `Here's the most affordable option for what I just showed you: ${names.join(', ')}. Tap an item to compare the other brands and sizes.`, plan, suggestions: ['Show more brands', 'Something healthy'] };
+  }
+  return null;
+}
+
 /* ── Dish recipe engine ─────────────────────────────────────
    A dish ("chicken biryani") needs MORE than its headline items: spices,
    vegetables, dairy, oil. This maps dishes -> the store group-keys that
@@ -969,6 +1016,26 @@ const DISH_RECIPES = {
       ['Seasoning', [['olive-oil',1],['black-pepper',1],['salt',1]]]
     ]
   },
+  alfredo: {
+    label: 'creamy Alfredo pasta',
+    proteins: { chicken:'chicken-breast', prawn:'prawns', shrimp:'prawns' }, defaultProtein: null,
+    sections: [
+      ['Pasta', [['pasta-spaghetti',1]]],
+      ['Protein', ['__protein__']],
+      ['Sauce', [['cream',2],['butter',1],['mozzarella',1],['garlic',1]]],
+      ['Seasoning', [['black-pepper',1],['salt',1],['olive-oil',1]]]
+    ]
+  },
+  margherita: {
+    label: 'Margherita pizza',
+    proteins: {}, defaultProtein: null,
+    sections: [
+      ['Base', [['flour-wheat',1],['pasta-sauce',1],['tomato-paste',1]]],
+      ['Cheese', [['mozzarella',2]]],
+      ['Topping', [['tomatoes',1]]],
+      ['Seasoning', [['olive-oil',1],['black-pepper',1],['salt',1]]]
+    ]
+  },
   salad: {
     label: 'salad',
     proteins: { chicken:'chicken-breast', tuna:'canned-tuna' },
@@ -999,6 +1066,59 @@ const DISH_RECIPES = {
       ['Fresh veg', [['lettuce',1],['tomatoes',1],['cucumber',1]]]
     ]
   },
+  raita: {
+    label: 'raita',
+    proteins: {}, defaultProtein: null,
+    sections: [
+      ['Base', [['plain-yogurt',1]]],
+      ['Fresh', [['cucumber',1],['onions',1],['tomatoes',1],['mint',1],['coriander',1]]],
+      ['Seasoning', [['cumin',1],['chili-powder',1],['salt',1]]]
+    ]
+  },
+  burger: {
+    label: 'burgers',
+    proteins: { chicken:'chicken-breast', beef:'beef-mince' },
+    defaultProtein: 'beef-mince',
+    sections: [
+      ['Buns', [['burger-buns',1]]],
+      ['Protein', ['__protein__']],
+      ['Toppings', [['cheese-slices',1],['lettuce',1],['tomatoes',1],['onions',1]]],
+      ['Sauces', [['ketchup',1],['mayonnaise',1]]],
+      ['On the side', [['frozen-fries',1]]]
+    ]
+  },
+  shawarma: {
+    label: 'shawarma',
+    proteins: { chicken:'chicken-thigh', beef:'beef-mince', mutton:'mutton', lamb:'mutton' },
+    defaultProtein: 'chicken-thigh',
+    sections: [
+      ['Bread', [['pita-bread',1],['arabic-bread',1]]],
+      ['Protein', ['__protein__']],
+      ['Sauce', [['plain-yogurt',1],['garlic',1],['lemons',1],['mayonnaise',1]]],
+      ['Fresh', [['tomatoes',1],['cucumber',1],['onions',1],['lettuce',1]]],
+      ['Spices', [['cumin',1],['black-pepper',1],['salt',1],['olive-oil',1]]]
+    ]
+  },
+  'fried rice': {
+    label: 'fried rice',
+    proteins: { chicken:'chicken-breast', prawn:'prawns', shrimp:'prawns', egg:'eggs' },
+    defaultProtein: 'eggs',
+    vegProtein: ['frozen-veg','carrots'],
+    sections: [
+      ['Rice', [['jasmine-rice',1]]],
+      ['Protein', ['__protein__']],
+      ['Vegetables', [['frozen-veg',1],['carrots',1],['onions',1],['garlic',1],['bell-pepper',1]]],
+      ['Sauces', [['soy-sauce',1],['vegetable-oil',1],['black-pepper',1],['salt',1]]]
+    ]
+  },
+  pancakes: {
+    label: 'pancakes',
+    proteins: {}, defaultProtein: null,
+    sections: [
+      ['Batter', [['flour-wheat',1],['eggs',1],['full-cream-milk',1],['butter',1],['sugar',1]]],
+      ['Toppings', [['honey',1],['chocolate-spread',1],['bananas',1]]]
+    ]
+  },
   sambar: {
     label: 'sambar',
     proteins: {}, defaultProtein: null,
@@ -1012,11 +1132,26 @@ const DISH_RECIPES = {
 };
 // Find the dish in the prompt and resolve the protein variant. Returns
 // [{group, qty, section}] limited to groups that exist in the catalogue.
+/* Dish names that are a variant of a base recipe ("Margherita" is a pizza).
+   Lets a clarify chip like "Margherita" or "Creamy Alfredo" build the cart. */
+const DISH_VARIANTS = [
+  [/\b(margherita|margarita)\b/, 'margherita'],
+  [/\b(pepperoni|bbq pizza|four cheese)\b/, 'pizza'],
+  [/\b(alfredo|carbonara)\b/, 'alfredo'],
+  [/\b(arrabbiata|bolognese|mac(?:aroni)? (?:and|n) cheese)\b/, 'pasta'],
+  [/\b(burgers?|cheeseburgers?)\b/, 'burger'],
+  [/\b(pancakes?)\b/, 'pancakes'],
+  [/\b(shawarmas?|shawerma)\b/, 'shawarma'],
+  [/\b(raitha|raita)\b/, 'raita']
+];
 function dishPlanGroups(text, groups) {
-  const t = ' ' + String(text || '').toLowerCase() + ' ';
+  let t = ' ' + String(text || '').toLowerCase() + ' ';
+  for (const [re, base] of DISH_VARIANTS) if (re.test(t) && !new RegExp('\\b' + base + '\\b').test(t)) t += base + ' ';
   let dish = null;
-  for (const k of Object.keys(DISH_RECIPES)) {
-    if (new RegExp('\\b' + k + '\\b').test(t)) { dish = k; break; }
+  const SPECIFIC_FIRST = ['alfredo', 'margherita', 'fried rice', 'raita', 'shawarma', 'burger', 'pancakes'];
+  const order = SPECIFIC_FIRST.concat(Object.keys(DISH_RECIPES).filter(k => !SPECIFIC_FIRST.includes(k)));
+  for (const k of order) {
+    if (DISH_RECIPES[k] && new RegExp('\\b' + k + '\\b').test(t)) { dish = k; break; }
   }
   if (!dish) return null;
   const R = DISH_RECIPES[dish];
@@ -1059,6 +1194,23 @@ function resolveRow(picked, qty, groups) {
   return rowFromMembers(members, qty, groups);
 }
 
+/* Whisper "hears" these on silence or background noise. Never send them to the assistant. */
+const WHISPER_GHOSTS = /^(?:you|thank you\.?|thanks\.?|thank you (?:so much )?for watching[.!]?|thanks for watching[.!]?|please subscribe[.!]?|subtitles? by .*|transcribed by .*|bye\.?|okay\.?|\.+|ok\.?|شكرا\.?|धन्यवाद\.?)$/i;
+function cleanTranscript(t) {
+  const s = String(t || '').replace(/\s+/g, ' ').trim();
+  if (!s || WHISPER_GHOSTS.test(s)) return '';
+  return s;
+}
+let VOICE_HINT = { n: -1, text: '' };
+function voiceVocabHint(catalog) {
+  if (VOICE_HINT.n === catalog.length) return VOICE_HINT.text;
+  const names = [...new Set(catalog.map(p => String(p.name || '').replace(/\s*\(.*?\)\s*/g, '').trim()).filter(Boolean))];
+  let text = 'Grocery order at a UAE supermarket: ';
+  for (const n of names) { if (text.length + n.length > 700) break; text += n + ', '; }
+  VOICE_HINT = { n: catalog.length, text: text.replace(/,\s*$/, '.') };
+  return VOICE_HINT.text;
+}
+
 /* ── Voice transcription (Whisper) ──
    The browser records mic audio and POSTs it here; we transcribe with Whisper,
    which auto-detects the language. Far more reliable than the browser's built-in
@@ -1069,7 +1221,11 @@ app.post('/api/transcribe',
   async (req, res) => {
     if (!TRANSCRIBER) return res.status(503).json({ error: 'no transcription provider configured' });
     if (!req.body || !req.body.length) return res.status(400).json({ error: 'empty audio' });
-    const tmp = path.join(os.tmpdir(), 'nx-voice-' + Date.now() + '.webm');
+    // Name the file after what the browser actually recorded: iPhone Safari sends
+    // audio/mp4, and Whisper decodes by extension — a .webm name garbles it.
+    const ct = String(req.headers['content-type'] || '').toLowerCase();
+    const ext = /mp4|m4a|aac/.test(ct) ? '.m4a' : /ogg/.test(ct) ? '.ogg' : /mpeg|mp3/.test(ct) ? '.mp3' : /wav/.test(ct) ? '.wav' : '.webm';
+    const tmp = path.join(os.tmpdir(), 'nx-voice-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7) + ext);
     // Language hint (ISO-639-1 like en/hi/ml/ar/ta) greatly improves accuracy
     // for non-English speech vs. auto-detect on short clips.
     const lang = (req.query.lang || '').toString().slice(0, 2).toLowerCase();
@@ -1077,8 +1233,13 @@ app.post('/api/transcribe',
       fs.writeFileSync(tmp, req.body);
       const opts = { file: fs.createReadStream(tmp), model: TRANSCRIBER.model, temperature: 0 };
       if (lang && lang !== 'au') opts.language = lang;   // 'au' = auto → omit
+      // Vocabulary hint: the store's own product names, so "labneh", "laban",
+      // "hammour", "samoon" come back spelled the way the catalogue spells them.
+      // English only — an English hint would pull auto-detect away from Hindi/Arabic.
+      if (lang === 'en') opts.prompt = voiceVocabHint(catalogOf(branchOf(req)));
       const r = await TRANSCRIBER.client.audio.transcriptions.create(opts);
-      res.json({ text: (r && r.text ? r.text : '').trim() });
+      const text = cleanTranscript(r && r.text ? r.text : '');
+      res.json({ text, empty: !text });
     } catch (e) {
       console.error('[nexus] transcribe error:', e.message);
       res.status(500).json({ error: 'transcription failed' });
@@ -1289,9 +1450,9 @@ app.post('/api/concierge', GUARD.limit('concierge'), GUARD.sanePrompt, async (re
     [/حليب/i, 'milk'],
   ];
   let searchPrompt = prompt;
-  for (const [re, en] of MULTILINGUAL_MAP) {
-    if (re.test(searchPrompt)) { searchPrompt = en; break; }
-  }
+  { const hits = [];
+    for (const [re, en] of MULTILINGUAL_MAP) if (re.test(prompt) && !hits.includes(en)) hits.push(en);
+    if (hits.length) searchPrompt = hits.join(', '); }   // "خبز وحليب" -> "bread, milk" (both, not just the first)
 
   // Keyword candidates — used to prioritise and as a no-LLM fallback plan.
   /* RAG retrieval: pull only the relevant products from the index instead of
@@ -1381,7 +1542,9 @@ app.post('/api/concierge', GUARD.limit('concierge'), GUARD.sanePrompt, async (re
   // Deterministic clarify for a bare ambiguous dish (English only) — guarantees
   // "biryani -> which type?" and avoids a wasted LLM call.
   // Don't run ambiguousDish on single-word answers (they're answering the clarify) or non-English
-  const amb = (!answeringClarify && !addOn && replyLang === 'English' && prompt.trim().split(/\s+/).length > 1) ? ambiguousDish(prompt) : null;
+  let normalizedPrompt = '';
+  try { normalizedPrompt = SEARCH.normalizeQuery(prompt, ix.size ? ix.items : catalog); } catch (_) {}
+  const amb = (!answeringClarify && !addOn && replyLang === 'English' && prompt.trim().split(/\s+/).length > 1) ? ambiguousDish(prompt + ' ' + normalizedPrompt) : null;
   if (amb) {
     reply = `Sure — let's make ${amb.dish}!`;
     clarify = `Which ${amb.dish} would you like to make?`;
@@ -1497,6 +1660,8 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
       }
       const raw = completion.choices?.[0]?.message?.content || '';
       const parsed = parseLLMJson(raw);
+      if (parsed && typeof parsed.reply === 'string') { LLM_STATUS.lastOkAt = new Date().toISOString(); }
+      else { LLM_STATUS.lastErrorAt = new Date().toISOString(); LLM_STATUS.lastError = 'model reply was not valid JSON'; }
       if (parsed && typeof parsed.reply === 'string') {
         reply = parsed.reply;
         followUp = typeof parsed.follow_up === 'string' ? parsed.follow_up : '';
@@ -1557,6 +1722,8 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
     } catch (error) {
       llmError = (error && (error.status === 429 || /rate.?limit|too many|quota/i.test(error.message || ''))) ? 'rate' : 'other';
       console.error('[nexus] LLM (' + LLM.name + ') warning:', error.message);
+      LLM_STATUS.lastErrorAt = new Date().toISOString();
+      LLM_STATUS.lastError = String((error && (error.status ? error.status + ' ' : '') + (error.message || error)) || 'error').slice(0, 200);
     }
   }
 
@@ -1591,7 +1758,11 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
     for (const dk of Object.keys(DISH_INGREDIENTS_MAP)) {
       if (promptLower.includes(dk)) { dishKey = dk; break; }
     }
-    if (llmError === 'rate') {
+    const fb = replyLang === 'English' ? smartFallback({ prompt, intent, history, already, groups, candidates }) : null;
+    if (fb) {
+      reply = fb.reply; suggestions = fb.suggestions || []; followUp = fb.followUp || '';
+      if (fb.plan) plan = fb.plan;
+    } else if (llmError === 'rate') {
       reply = L('busy');
     } else if (intent === 'general_conversation') {
       reply = L('hello');
@@ -1632,9 +1803,17 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
       const MATCH = {
         English: dishReply || (plan.length
           ? (candidates.corrected && candidates.corrected.length ? `Showing results for "${candidates.corrected.map(c => c[1]).join('", "')}". ` : '') +
-            (searchSegs.length > 1
+            (/\b(cold|soft|fizzy)\s+drinks?\b|\bdrinks?\b/i.test(prompt) && plan.every(r => r.p.cat === 'Beverages')
+              ? `Here are some chilled drinks${addOn || /\bside|with\b/i.test(prompt) ? ' to go with it' : ''} — ${plan.slice(0, 3).map(r => r.p.name).join(', ')} and more. Tap any item to see other brands and sizes.`
+              : searchSegs.length > 1 && !(/\bwhere\b|\bwhich (?:aisle|shelf|rack)\b|\blocate\b/i.test(prompt) && plan[0] && plan[0].p.loc)
               ? `Here's what I found for ${searchSegs.filter(x => x.products.length).map(x => x.tokens.join(' ')).join(', ')}. Tap any item to see more brands and sizes.`
-              : `I found ${plan.length} item${plan.length > 1 ? 's' : ''} for you — including ${productNames}. Tap any item to see more brands and sizes.`)
+              : /^\s*(?:do|does) (?:you|the store) (?:have|sell|stock|carry)|^\s*(?:have you got|is there|are there|got any|any)\b/i.test(prompt)
+              ? `Yes, we have ${productNames}${plan.length > 3 ? ' and more' : ''}.` + (plan[0] && plan[0].p.loc ? ` You'll find ${plan[0].p.name} at ${plan[0].p.loc}.` : '') + ' Tap any item to see other brands and sizes.'
+              : (intent === 'navigation' || /\bwhere\b|\bwhich (?:aisle|shelf|rack)\b|\bfind\b|\blocate\b/i.test(prompt)) && plan[0] && plan[0].p.loc
+              ? `${plan[0].p.name} is at ${plan[0].p.loc}.` + (plan.length > 1 ? ` I've also listed ${plan.slice(1, 3).map(r => r.p.name).join(' and ')}.` : '') + ' Tap Navigate to get walking directions.'
+              : plan.length === 1
+              ? `Here's ${plan[0].p.name}. Tap it to see other brands and sizes.`
+              : `I found ${plan.length} items for you — including ${productNames}. Tap any item to see more brands and sizes.`)
           : `I couldn't find an exact match. Try describing what you need differently, e.g. "bread, cheese and tomatoes for a sandwich".`),
         Malayalam: `നിങ്ങളുടെ അഭ്യർത്ഥനയ്ക്ക് അനുയോജ്യമായ ഉൽപ്പന്നങ്ങൾ ലഭ്യമാണ്. ബ്രാൻഡ്, സൈസ് കാണാൻ ഓരോ ഉൽപ്പന്നവും ടാപ്പ് ചെയ്യൂ.`,
         Arabic: `وجدت منتجات تناسب طلبك — اضغط على أي منتج لرؤية جميع الماركات والأحجام المتاحة.`,
@@ -1666,7 +1845,8 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
         reply = DISH_REPLY[replyLang] || DISH_REPLY.English;
       } else if (replyLang === 'English' && searchSegs.length && intent !== 'general_conversation') {
         // The shopper named something specific and we do not stock it: say so plainly.
-        const nf = searchSegs.map(x => x.tokens.join(' ')).join(', ');
+        const nf = prompt.replace(/^\s*(?:hi|hey|hello)?[\s,]*(?:(?:i|we)\s+(?:need|want|would like|am looking for|'m looking for)|looking for|do you (?:have|sell|stock)|have you got|is there(?: any)?|can i (?:get|buy)|any)\s+/i, '')
+          .replace(/[?.!]+$/, '').trim() || searchSegs.map(x => x.text).join(', ');
         reply = `Sorry, I couldn't find "${nf}" in our store right now. Try another name or brand, or tell me a dish and I'll build the shopping list for it.`;
       } else {
         reply = HUH[replyLang] || HUH.English;
@@ -1718,7 +1898,10 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
      keyword hits (which gave "rice + chicken" only). */
   if (!clarify && !addOn && !/masala|powder|spice mix/i.test(prompt) && (intent === 'recipe_assistance' || !usedLLM) && (usedLLM ? plan.length > 0 : true)) {
     try {
-      const dp = dishPlanGroups(script ? searchPrompt + ' ' + prompt : prompt, groups);   // protein from the shopper's words, not the generic non-English expansion
+      // protein from the shopper's words, not the generic non-English expansion; when this
+      // message answers "Which pizza would you like?", read it together with that question
+      const dishText = (script ? searchPrompt + ' ' + prompt : prompt) + ' ' + normalizedPrompt + (answeringClarify ? ' ' + pendingQuestion : '');
+      const dp = dishPlanGroups(dishText, groups);
       if (dp && dp.items.length) {
         const gk = r => r.p.group || ('solo-' + r.p.id);
         const hasMeat = plan.some(r => PROTEIN_GROUPS.includes(gk(r)));
@@ -1741,13 +1924,32 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
         if (!usedLLM) {
           if (replyLang === 'English') {
             const secs = [...new Set(plan.map(r => r.section).filter(Boolean))].map(x => x.toLowerCase());
-            const title = (dp.veg ? 'vegetable ' : '') + dp.label;
-            reply = `Here's everything you need for ${title}: ${secs.join(', ')}. I've picked the best-value option for each — tap any item to swap brands or sizes.`;
-            followUp = 'Want me to add raita ingredients, a side salad or cold drinks to go with it?';
+            const PNAME = { 'whole-chicken': 'chicken', 'chicken-breast': 'chicken', 'chicken-thigh': 'chicken', mutton: 'mutton', 'beef-mince': 'beef', prawns: 'prawn', 'fish-hammour': 'fish', 'fish-salmon': 'salmon', 'canned-tuna': 'tuna', eggs: 'egg' };
+            const title = (dp.veg ? 'vegetable ' : (dp.protein && PNAME[dp.protein] && !new RegExp(PNAME[dp.protein], 'i').test(dp.label) ? PNAME[dp.protein] + ' ' : '')) + dp.label;
+            const heads = plan.slice(0, 4).map(r => r.p.name).filter(Boolean);
+            reply = `Here's everything you need for ${title} — ${heads.join(', ')} and more, grouped as ${secs.join(', ')}. I've picked the best-value option for each; tap any item to swap brands or sizes.`;
+            const SIDES = { biryani: ['Add raita ingredients', 'Add cold drinks', 'Add a dessert'], curry: ['Add rice or naan', 'Add raita ingredients', 'Add cold drinks'],
+              pizza: ['Add cold drinks', 'Add a side salad', 'Add a dessert'], margherita: ['Add cold drinks', 'Add a side salad', 'Add a dessert'],
+              pasta: ['Add a side salad', 'Add cold drinks', 'Add garlic bread'], alfredo: ['Add a side salad', 'Add cold drinks', 'Add a dessert'], burger: ['Add cold drinks', 'Add a side salad', 'Add ice cream'],
+              raita: ['Add biryani ingredients', 'Add basmati rice', 'Add cold drinks'] };
+            suggestions = SIDES[dp.dish] || ['Add cold drinks', 'Add a side salad', 'Add a dessert'];
+            followUp = dp.dish === 'raita' ? 'Making it to go with biryani or curry? I can add those too.' : 'Want me to add a side salad, cold drinks or a dessert to go with it?';
           }
         }
       }
     } catch (e) { console.error('[nexus] dish plan warning:', e.message); }
+  }
+
+  /* Items the store never sells (alcohol, pork, tobacco): say so plainly
+     instead of showing a lookalike. Anything else they asked for still shows. */
+  const unavailable = (candidates.unavailable || []);
+  if (unavailable.length && replyLang === 'English' && !usedLLM) {
+    const what = unavailable.map(u => u === 'alcohol' ? 'alcoholic drinks' : u === 'tobacco' ? 'tobacco products' : 'pork products').join(' or ');
+    const alt = unavailable.includes('alcohol') ? ' Can I suggest soft drinks, juices or sparkling water instead?' : '';
+    reply = plan.length
+      ? `We don't sell ${what}, but here's the rest of what you asked for.${alt}`
+      : `Sorry, we don't sell ${what} at this store.${alt}`;
+    if (!plan.length) suggestions = unavailable.includes('alcohol') ? ['Soft drinks', 'Juices', 'Sparkling water'] : ['Chicken', 'Beef', 'Fresh produce'];
   }
 
   // NOTE: when the LLM succeeds we TRUST its item list. If it returned no items
@@ -1846,6 +2048,7 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
 
   // Remember the groups we're showing now (for future add-on filtering).
   plan.forEach(r => already.add(rowGroup(r)));
+  SUGGESTED.set(sessionId, [...already].slice(-80));
 
   const total = plan.reduce((sum, r) => sum + lineOf(r), 0);
 

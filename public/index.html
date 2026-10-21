@@ -8179,8 +8179,18 @@ async function applyCoupon(){
   }catch(e){msg.innerHTML='<span style="color:#E53935">Could not check that coupon</span>'}
 }
 function renderCkTotalsOnly(){ if(cartCnt())renderCk() }
+let PLACING_ORDER=false;
 async function placeOrder(){
+  /* ignore extra taps while an order is already being sent */
+  if(PLACING_ORDER)return;
+  PLACING_ORDER=true;
+  const btn=document.querySelector('.ck-confirm');if(btn){btn.disabled=true;btn.style.opacity='.6'}
+  try{return await placeOrderOnce()}
+  finally{PLACING_ORDER=false;if(btn){btn.disabled=false;btn.style.opacity=''}}
+}
+async function placeOrderOnce(){
   const items=cartArr(),t=cartTots();
+  if(!window.__ckRef)window.__ckRef='ck_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,10);
   const name=document.getElementById('ckName')?.value.trim()||'Guest Customer';
   const cx=checkoutPhone();
   const phone=cx.phone;
@@ -8207,7 +8217,7 @@ async function placeOrder(){
   const branchId=(ckMode==='pickup'&&ckBr&&ckBr.value)||BRANCH||(typeof locCurrent==='function'&&(locCurrent()||{}).id)||'';
   const branch=(ckBr&&ckBr.selectedIndex>=0?ckBr.options[ckBr.selectedIndex].text.split(' · ')[0]:'')||localStorage.getItem('devx-branch-label')||'Madina Supermarket — Deira (Branch 3)';
   let order={
-    cid:CID,date:new Date().toISOString(),mode:ckMode,branch,branchId,payMethod:ckPay,
+    cid:CID,clientRef:window.__ckRef,date:new Date().toISOString(),mode:ckMode,branch,branchId,payMethod:ckPay,
     coupon:CK_COUPON||null,slotKey:slotKey||null,
     customer:{name,phone,addr,slot},
     items:items.map(i=>i.loose?({id:i.id,name:i.name,qty:1,loose:true,grams:i.grams,price:i.price,loc:i.loc,unit:i.unit}):({id:i.id,name:i.name,qty:i.qty,price:i.price,loc:i.loc,unit:i.unit})),
@@ -8236,6 +8246,7 @@ async function placeOrder(){
         return;
       }
       order=j.order;
+      window.__ckRef=null;   // next checkout gets a new reference
       if(j.state){Object.keys(j.state).forEach(k=>CACHE[k]=j.state[k]);if(j.state['devx-orders'])CACHE[NXK.ord]=j.state['devx-orders'];if(j.state['devx-notifs-customer'])CACHE[NXK.ntf]=j.state['devx-notifs-customer'];}
       if(CACHE[NXK.ord])syncNotifBadge();
       CK_COUPON='';CK_DISC=0;

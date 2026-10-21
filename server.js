@@ -1891,6 +1891,14 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
 /* Customer places an order */
 app.post('/api/orders', GUARD.limit('write'), async (req, res) => {
   const o = req.body || {};
+  /* One checkout = one order. The app tags each checkout with a random
+     clientRef; if the same request arrives again (retry, double tap, slow
+     network) the order already created is returned instead of a duplicate. */
+  if (o.clientRef) {
+    o.clientRef = String(o.clientRef).slice(0, 64);
+    const dup = (db['devx-orders'] || []).find(x => x.clientRef === o.clientRef);
+    if (dup) return res.json({ order: dup, duplicate: true });
+  }
   const shopperSession = shopper(req);
   if (shopperSession) {
     o.cid = o.cid || String(req.headers['x-customer-cid'] || '');

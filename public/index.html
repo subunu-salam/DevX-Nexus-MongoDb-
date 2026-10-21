@@ -7207,18 +7207,34 @@ function openOrderDetails(id){
   const st=NX_ST[o.status]||NX_ST.new;
   const adds=(ORDER_ADDITIONS[o.id]||[]);
   const activeAdds=adds.filter(a=>!['rejected','expired','cancelled'].includes(String(a.status||'').toLowerCase()));
-  const baseIds=new Set((o.items||[]).map(i=>`${i.id}|${i.name}|${i.qty||1}|${i.grams||''}`));
-  const merged=[...(o.items||[])];
-  activeAdds.forEach(a=>(a.items||[]).forEach(i=>{
-    const key=`${i.id}|${i.name}|${i.qty||1}|${i.grams||''}`;
-    if(!baseIds.has(key)&&['approved_awaiting_payment','approved_cod_merged','paid_merged','approved'].includes(String(a.status||'').toLowerCase()))merged.push(i);
-  }));
+  /* Bill = original items + approved add-ons + delivery fee ± discounts.
+     The server may already have merged add-on items into o.items, so take
+     each add-on item out of the base list once before listing it separately. */
+  const APPROVED_ADD=['approved_awaiting_payment','approved_cod_merged','paid_merged','approved'];
+  const approvedAdds=activeAdds.filter(a=>APPROVED_ADD.includes(String(a.status||'').toLowerCase()));
+  const pendingAdds=activeAdds.filter(a=>!APPROVED_ADD.includes(String(a.status||'').toLowerCase()));
+  const addItems=[];approvedAdds.forEach(a=>(a.items||[]).forEach(i=>addItems.push(Object.assign({},i,{__addon:true}))));
+  const base=[...(o.items||[])];
+  addItems.forEach(ai=>{const k=base.findIndex(b=>String(b.id)===String(ai.id)&&b.name===ai.name&&Number(b.qty||1)===Number(ai.qty||1)&&String(b.grams||'')===String(ai.grams||''));if(k>=0)base.splice(k,1)});
+  const merged=[...base,...addItems];
+  const lineAmt=i=>i.loose?Number(i.price||0):Number(i.price||0)*Number(i.qty||1);
+  const baseSum=base.reduce((t,i)=>t+lineAmt(i),0);
+  const addSum=approvedAdds.reduce((t,a)=>t+Number(a.total||0),0);
+  const fee=Number(o.fee||0);
+  const adjust=Math.round((Number(o.total||0)-baseSum-addSum-fee)*100)/100;
+  const row=(l,v,st)=>`<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:13px;color:var(--tx2);${st||''}"><span>${l}</span><b style="color:var(--tx)">${v}</b></div>`;
+  const billRows=row('Items',`AED ${baseSum.toFixed(2)}`)
+    +(approvedAdds.length?row('Additional products',`AED ${addSum.toFixed(2)}`):'')
+    +(fee?row('Delivery fee',`AED ${fee.toFixed(2)}`):'')
+    +(Math.abs(adjust)>=0.01?row(adjust<0?'Discounts & offers':'Adjustments',`${adjust<0?'−':''}AED ${Math.abs(adjust).toFixed(2)}`):'')
+    +(pendingAdds.length?row('Add-ons awaiting approval (not in total)',`AED ${pendingAdds.reduce((t,a)=>t+Number(a.total||0),0).toFixed(2)}`,'font-style:italic'):'');
+  const tag=i=>i.__addon?'<span style="margin-left:6px;font-size:9px;font-weight:900;color:var(--GD);background:var(--GL);border-radius:6px;padding:2px 6px;text-transform:uppercase">Add-on</span>':'';
   const items=merged.map(i=>{
-    if(!i.loose)return `<div style="display:flex;justify-content:space-between;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid var(--bdr)"><div><div style="font-weight:800;color:var(--tx)">${esc(i.name)}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">Qty ${i.qty||1}</div></div><b style="white-space:nowrap">AED ${Number((i.price||0)*(i.qty||1)).toFixed(2)}</b></div>`;
+    if(!i.loose)return `<div style="display:flex;justify-content:space-between;align-items:center;gap:14px;padding:12px 0;border-bottom:1px solid var(--bdr)"><div><div style="font-weight:800;color:var(--tx)">${esc(i.name)}${tag(i)}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">Qty ${i.qty||1}</div></div><b style="white-space:nowrap">AED ${Number((i.price||0)*(i.qty||1)).toFixed(2)}</b></div>`;
     const eg=Number(i.estimatedGrams||i.grams||0), ag=Number(i.actualGrams||eg);
     const ep=Number(i.estimatedPrice!=null?i.estimatedPrice:(i.perKg||0)*eg/1000), ap=Number(i.price||0);
     const wc=ag!==eg, pc=Math.abs(ap-ep)>0.005;
-    return `<div style="padding:12px 0;border-bottom:1px solid var(--bdr)"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px"><div><div style="font-weight:800;color:var(--tx)">${esc(i.name)}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">${eg} g → <b style="${wc?'color:#D62828':''}">${ag} g</b>${wc?'<span style="color:#D62828;font-weight:900;margin-left:5px">Weight changed</span>':''}</div></div><b style="white-space:nowrap;${pc?'color:#D62828':''}">${pc?`<span style="color:var(--tx3);text-decoration:line-through;margin-right:4px">AED ${ep.toFixed(2)}</span>`:''}AED ${ap.toFixed(2)}</b></div>${pc?'<div style="margin-top:4px;color:#D62828;font-size:10px;font-weight:900;text-align:right">Price changed after weighing</div>':''}</div>`;
+    return `<div style="padding:12px 0;border-bottom:1px solid var(--bdr)"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px"><div><div style="font-weight:800;color:var(--tx)">${esc(i.name)}${tag(i)}</div><div style="font-size:11px;color:var(--tx3);margin-top:3px">${eg} g → <b style="${wc?'color:#D62828':''}">${ag} g</b>${wc?'<span style="color:#D62828;font-weight:900;margin-left:5px">Weight changed</span>':''}</div></div><b style="white-space:nowrap;${pc?'color:#D62828':''}">${pc?`<span style="color:var(--tx3);text-decoration:line-through;margin-right:4px">AED ${ep.toFixed(2)}</span>`:''}AED ${ap.toFixed(2)}</b></div>${pc?'<div style="margin-top:4px;color:#D62828;font-size:10px;font-weight:900;text-align:right">Price changed after weighing</div>':''}</div>`;
   }).join('');
   const addInfo=activeAdds.length?`<div style="margin-top:14px;padding:14px 15px;border:1px solid #bfe5cc;background:var(--GL);border-radius:15px"><div style="font-size:11px;text-transform:uppercase;letter-spacing:.08em;font-weight:900;color:var(--GD)">Additional products</div>${activeAdds.map(a=>`<div style="margin-top:8px;font-size:12px;color:var(--tx2)">${a.status==='pending_admin_approval'?'Pending admin approval':a.status==='approved_awaiting_payment'?'Approved — awaiting additional payment':a.status==='approved_cod_merged'?'Approved — added to order':'Added to order'} · AED ${Number(a.total||0).toFixed(2)}${(a.items||[]).length?`<div style="margin-top:6px">${a.items.map(i=>`<div style="padding:4px 0">${esc(i.name||'Product')} · ${i.loose?`Weight: ${Number(i.actualGrams||i.grams||0)} g`:`Qty: ${Number(i.qty||1)}`}</div>`).join('')}</div>`:''}</div>`).join('')}</div>`:'';
   const canAdd=poEligible(o);
@@ -7227,7 +7243,7 @@ function openOrderDetails(id){
   document.querySelector('#locSheet .sheet-hdr h2').textContent='Order details';
   body.innerHTML=`<div style="padding:2px 0 24px">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:16px"><div><div class="mo-id" style="font-size:20px">${esc(o.id)}</div><div class="mo-date">${new Date(o.date).toLocaleString()}</div></div><span class="mo-chip" style="background:${st.c}">${st.l}</span></div>
-    <div style="border:1px solid var(--bdr);border-radius:16px;padding:15px;background:var(--card)"><div class="dw-sec">Items</div>${items}<div style="display:flex;justify-content:space-between;padding-top:14px;font-size:16px;font-weight:900"><span>Order total</span><span style="color:var(--GD)">AED ${Number(o.total||0).toFixed(2)}</span></div></div>
+    <div style="border:1px solid var(--bdr);border-radius:16px;padding:15px;background:var(--card)"><div class="dw-sec">Items</div>${items}<div style="padding-top:10px">${billRows}</div><div style="display:flex;justify-content:space-between;padding-top:10px;margin-top:4px;border-top:1px solid var(--bdr);font-size:16px;font-weight:900"><span>Order total</span><span style="color:var(--GD)">AED ${Number(o.total||0).toFixed(2)}</span></div></div>
     <div class="order-pay-card"><div class="order-pay-title">Delivery & payment</div><div class="order-pay-row"><span>Payment</span><b>${o.payMethod==='online'?'Online payment':o.payMethod==='card_machine'?'Card machine':'Cash on delivery'}</b></div><div class="order-pay-row"><span>Delivery</span><b>${o.mode==='delivery'?'Delivery':'Store pickup'}</b></div>${o.mode==='delivery'?`<div class="order-pay-row"><span>Address</span><b>${esc(o.customer?.addr||'Not provided')}</b></div>`:''}</div>${addInfo}${addButton}
   </div>`;
   document.getElementById('drkOverlay').classList.add('on');document.getElementById('locSheet').classList.add('on');

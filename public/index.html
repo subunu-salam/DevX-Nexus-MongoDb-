@@ -5923,7 +5923,7 @@ async function nxBoot(){
         if(ch['devx-branding']) loadClientBranding();
         nxOnRemote();
       });
-    }catch(e){setInterval(async()=>{try{const r2=await fetch('/api/state?'+stateQS(),{cache:'no-store'});if(r2.ok){Object.assign(CACHE,await r2.json());nxOnRemote()}}catch(e2){}},4000)}
+    }catch(e){setInterval(async()=>{try{const r2=await fetch('/api/state?'+stateQS(),{cache:'no-store',headers:custHeaders()});if(r2.ok){Object.assign(CACHE,await r2.json());nxOnRemote()}}catch(e2){}},4000)}
   }catch(e){}
 }
 function nxOnRemote(){

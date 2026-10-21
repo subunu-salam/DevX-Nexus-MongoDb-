@@ -1213,7 +1213,15 @@ async function nxBoot(){
       Object.keys(ch).forEach(k=>{CACHE[k]=ch[k]});
       onRemote();
     });
-  }catch(e){setInterval(async()=>{try{const st=await tryLogin(ADMIN_PIN);if(st){Object.assign(CACHE,st);onRemote()}}catch(e2){}},4000)}
+  }catch(e){setInterval(async()=>{try{
+    /* No live socket (e.g. Vercel): poll with the signed-in session. Only an
+       authorised admin state may replace the cache — a public/anonymous answer
+       has no orders and would wipe the dashboard. */
+    const r=await fetch('/api/state',{headers:authHeaders(),cache:'no-store'});
+    if(!r.ok)return;
+    const st=await r.json();
+    if(!st||!st['branch-meta'])return;
+    Object.assign(CACHE,st);onRemote()}catch(e2){}},4000)}
 }
 function onRemote(){
   reload();

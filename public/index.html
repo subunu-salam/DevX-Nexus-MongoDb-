@@ -6177,7 +6177,7 @@ function openLoyalty(){
             <button class="otp-link" onclick="backToPhone()">Change number</button>
           </div>
         `}
-        <button class="otp-link" onclick="closeOtp()">Not now</button>
+        <button class="otp-link" onclick="window.__checkoutResume=false;closeOtp()">Not now</button>
       </div>
     </div>`);
   setTimeout(()=>document.getElementById('otpPhone')?.focus(),80);
@@ -6232,7 +6232,7 @@ async function loginWithPin(){
     CTOKEN=d.token;localStorage.setItem('devx-ctoken',CTOKEN);MY_PHONE=d.profile.phone;localStorage.setItem('devx-phone',MY_PHONE);if(d.profile.name){MY_NAME=d.profile.name;localStorage.setItem('devx-name',d.profile.name);}
     closeOtp();setEngagementVisible(true);engagePersonalStreak().finally(loadPersonalGoal);showToast('Signed in ✓','green');loadMyOffers();
     try{const st=await (await fetch('/api/state?'+stateQS(),{headers:custHeaders()})).json();Object.keys(st).forEach(k=>CACHE[k]=st[k]);renderOrdersSheet()}catch(e){}
-    if(window.__checkoutResume){window.__checkoutResume=false;renderCk();setTimeout(()=>placeOrder(),120)}
+    if(window.__checkoutResume){window.__checkoutResume=false;if(cartArr().length){renderCk();showToast('Signed in — review and place your order','green')}}
   }catch(e){err.textContent=e.message||'Could not reach the store';btn.disabled=false;btn.textContent='Continue with PIN'}
 }
 async function registerWithPin(){

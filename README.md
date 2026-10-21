@@ -106,3 +106,14 @@ render.yaml        Render blueprint
 - Request status: pending admin approval -> approved awaiting payment -> paid and merged, or rejected.
 - Admin approves/rejects from the order drawer.
 - Customer sees the approval result in My Orders and completes the additional payment before items merge into the original order.
+
+## Deploying on Vercel
+
+`vercel.json` + `api/index.js` run the Express app as a Vercel function; `public/` is served as static files.
+Set these in Vercel → Project → Settings → Environment Variables: `MONGODB_URI`, `MONGODB_DB`, `ADMIN_PIN`,
+`GROQ_API_KEY`, `RESEND_API_KEY`, `MAIL_FROM` (plus any optional ones from `.env.example`).
+MongoDB is required on Vercel — without it nothing is saved.
+
+On Vercel, live socket updates are unavailable; the customer app and admin panel automatically refresh every 4 s instead.
+Each request saves to MongoDB before replying and picks up changes from other instances; order numbers come from an
+atomic counter in MongoDB (`nexus_meta.order_seq`). `node server.js` (local / Render) works exactly as before.

@@ -33,7 +33,9 @@ const { Push } = require('./lib/push');
 
 const PORT = process.env.PORT || 3000;
 const ADMIN_PIN = process.env.ADMIN_PIN || '1234';
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const ON_VERCEL = !!process.env.VERCEL;
+// Vercel's filesystem is read-only except /tmp
+const DATA_DIR = process.env.DATA_DIR || (ON_VERCEL ? path.join(os.tmpdir(), 'nexus-data') : path.join(__dirname, 'data'));
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 
 const app = express();
@@ -1883,7 +1885,7 @@ ${storeMenu(groups, !!budget)}${nutriFacts}`;
 });
 
 /* Customer places an order */
-app.post('/api/orders', GUARD.limit('write'), (req, res) => {
+app.post('/api/orders', GUARD.limit('write'), async (req, res) => {
   const o = req.body || {};
   const shopperSession = shopper(req);
   if (shopperSession) {
@@ -1896,7 +1898,8 @@ app.post('/api/orders', GUARD.limit('write'), (req, res) => {
   if (o.items.length > 200) return res.status(400).json({ error: 'too many line items' });
   if (!['delivery', 'pickup'].includes(o.mode)) return res.status(400).json({ error: 'bad mode' });
 
-  db['devx-order-count'] += 1;
+  try { db['devx-order-count'] = await STORE.nextOrderNumber(db['devx-order-count']); }
+  catch (e) { db['devx-order-count'] += 1; }
   o.id = 'NX-' + String(db['devx-order-count']).padStart(4, '0');
   o.date = new Date().toISOString();
   o.status = 'new';
@@ -3752,18 +3755,51 @@ app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'adm
 /* Boot in order: storage first, then seed only what storage did not supply,
    then build the index. Listening starts last so no request can arrive before
    the catalogue is queryable. */
-(async () => {
+const ready = (async () => {
   await load();
   TEN.migrate(db, STORES.fallbackId(db));
   seedCatalog();
   ensureOwner();
   reindex();
-  server.listen(PORT, () => {
-    const st = STORE.status();
-    console.log(`[nexus] storage: ${st.driver}${st.durable ? ' (durable)' : ' (EPHEMERAL — set MONGODB_URI or DATABASE_URL)'}`);
-    console.log(`[nexus] DevX Nexus running  →  http://localhost:${PORT}  (admin: /admin, PIN: ${ADMIN_PIN})`);
-  });
+  if (ON_VERCEL) await STORE.flushNow();   // seeded data must land before this instance can be frozen
+  const st = STORE.status();
+  console.log(`[nexus] storage: ${st.driver}${st.durable ? ' (durable)' : ' (EPHEMERAL — set MONGODB_URI or DATABASE_URL)'}`);
 })();
+
+/* ── Serverless (Vercel) entry ──
+   Every request: wait for boot, pull in what other instances saved, run the
+   app, and — for anything that changes data — save to MongoDB BEFORE the reply
+   is sent, because Vercel may freeze the instance right after it. */
+const CATALOG_KEYS = ['devx-catalog', 'devx-catalogs'];
+async function vercelHandler(req, res) {
+  await ready;
+  try {
+    const changed = await STORE.refresh();
+    if (changed.some(k => CATALOG_KEYS.includes(k))) reindex();
+  } catch (e) { console.error('[nexus] refresh failed:', e.message); }
+  {
+    // flush is a no-op when nothing changed, so it is safe on every request
+    const end = res.end;
+    let ending = false;
+    res.end = function (...args) {
+      if (ending) return end.apply(this, args);
+      ending = true;
+      STORE.flushNow().catch(e => console.error('[nexus] flush failed:', e.message))
+        .finally(() => end.apply(this, args));
+      return this;
+    };
+  }
+  return app(req, res);
+}
+
+if (require.main === module) {
+  ready.then(() => server.listen(PORT, () => {
+    console.log(`[nexus] DevX Nexus running  →  http://localhost:${PORT}  (admin: /admin, PIN: ${ADMIN_PIN})`);
+  }));
+}
+module.exports = vercelHandler;
+module.exports.app = app;
+module.exports.ready = ready;
 
 /* An unhandled rejection used to vanish into the void; a store reporting "it
    stopped working" then had nothing to look at. Both handlers record rather

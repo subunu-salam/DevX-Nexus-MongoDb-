@@ -10,3 +10,4 @@ seed-96k.json
 pitch/node_modules/
 .scratch/
 .env
+.vercel

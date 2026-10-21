@@ -345,6 +345,8 @@ function fullState(branchId) {
   const s = {};
   KEYS.forEach(k => s[k] = db[k]);
   delete s['devx-push'];   // private VAPID key + device endpoints stay server-side
+  // login tokens and OTP codes are server-only — never send them to a browser
+  for (const k of SharedMap.keys()) delete s[k];
   /* A picker at one shop must not see another shop's queue. Owners switch
      branches explicitly, which branchOf() already resolves. */
   for (const ord of db['devx-orders']) {
